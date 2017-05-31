@@ -3,11 +3,11 @@ import re
 import logging as log
 from abc import ABCMeta, abstractmethod
 import time
+import pymongo
 from pymongo import MongoClient
 
 
 class HashTagSearch(metaclass=ABCMeta):
-
     def __init__(self, request_timeout=10, error_timeout=10, request_retries=3):
         """
         This class performs a search on Instagrams hashtag search, and extracts posts for that given hashtag.
@@ -109,7 +109,7 @@ class HashTagSearch(metaclass=ABCMeta):
     def extract_owner_details(owner):
         user = dict()
         user['userId'] = owner['id']
-        user['username'] = owner["username"] if 'username'in owner else None
+        user['username'] = owner["username"] if 'username' in owner else None
         user['isPrivate'] = True if 'is_private' in owner else False
         return user
 
@@ -191,21 +191,29 @@ class HashTagSearch(metaclass=ABCMeta):
 
 
 class HashTagSearchExample(HashTagSearch):
-
     def __init__(self):
         super().__init__()
-        self.total_posts = 0
+        self.duplicate_posts = 0
+        self.new_posts = 0
         self.client = MongoClient('mongodb://localhost:27017/')
         self.db = self.client['instagram']
         self.posts = self.db['posts']
+        self.posts.ensure_index("postId", unique=True)
 
     def save_results(self, instagram_results):
         super().save_results(instagram_results)
-        log.info("Posts scraped: {}".format(len(instagram_results)))
+        new_posts = 0
+        duplicate_posts = 0
         for i, post in enumerate(instagram_results):
-            self.total_posts += 1
-            self.posts.insert_one(post)
-            # print("%i - %s" % (self.total_posts, post.processed_text()))
+            try:
+                self.posts.insert_one(post)
+                new_posts += 1
+            except pymongo.errors.DuplicateKeyError as ex:
+                duplicate_posts += 1
+            self.new_posts += new_posts
+            self.duplicate_posts += duplicate_posts
+        log.info("New posts: {}".format(new_posts))
+        log.info("Duplicate posts: {}".format(duplicate_posts))
 
 
 if __name__ == '__main__':
@@ -217,5 +225,8 @@ if __name__ == '__main__':
         crawler.extract_recent_tag("food")
     except Exception as e:
         log.info(str(e))
-    log.info("Posts: {}".format(crawler.total_posts))
+    log.info("------------------------------")
+    log.info("Stored posts: {}".format(crawler.new_posts))
+    log.info("Duplicate posts: {}".format(crawler.duplicate_posts))
     log.info("Elapsed time: {}".format(time.time() - start_time))
+    log.info("------------------------------")
