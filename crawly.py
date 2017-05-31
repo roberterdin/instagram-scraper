@@ -1,89 +1,16 @@
-import json
 import requests
 import re
 import logging as log
 from abc import ABCMeta, abstractmethod
 import time
-
-
-class InstagramUser:
-
-    def __init__(self, user_id, username=None, bio=None, followers_count=None, following_count=None, is_private=False):
-        """
-        A class to represent an Instagram User
-
-        :param user_id: User ID of instagram user
-        :param username: Username of Instagram user
-        :param bio: Bio text for user
-        :param followers_count: Number of followers
-        :param following_count: Number of people following
-        :param is_private: Boolean to indicate if account is private or not
-        """
-        self.id = user_id
-        self.username = username
-        self.bio = bio
-        self.followers_count = followers_count
-        self.following_count = following_count
-        self.is_private = is_private
-
-
-class InstagramPost:
-
-    def __init__(self, post_id, code,
-                 user=None,
-                 caption="",
-                 tags=[],
-                 comments=None,
-                 likes=None,
-                 img_small=None,
-                 img_large=None,
-                 is_video=False,
-                 created_at=None):
-        """
-        A class to represent a post on Instagram
-        """
-        self.post_id = post_id
-        self.code = code
-        self.caption = caption
-        self.tags = tags
-        self.comments = comments
-        self.likes = likes
-        self.user = user
-        self.img_small = img_small
-        self.img_large = img_large
-        self.is_video = is_video
-        self.created_at = created_at
-
-    def processed_text(self):
-        """
-        Processes a caption to remove newlines in it.
-        :return:
-        """
-        if self.caption is None:
-            return ""
-        else:
-            text = re.sub('[\n\r]', ' ', self.caption)
-            return text
-
-    def hashtags(self):
-        """
-        Simple hashtag extractor to return the hastags in the post
-        :return:
-        """
-        hashtags = []
-        if self.caption is None:
-            return hashtags
-        else:
-            for tag in re.findall("#[a-zA-Z0-9]+", self.caption):
-                hashtags.append(tag)
-            return hashtags
+from pymongo import MongoClient
 
 
 class HashTagSearch(metaclass=ABCMeta):
 
     def __init__(self, request_timeout=10, error_timeout=10, request_retries=3):
         """
-        This class performs a search on Instagrams hashtag search engine, and extracts posts for that given hashtag.
+        This class performs a search on Instagrams hashtag search, and extracts posts for that given hashtag.
 
         There are some limitations, as this does not extract all occurrences of the hash tag.
 
@@ -94,7 +21,6 @@ class HashTagSearch(metaclass=ABCMeta):
         :param request_retries: Number of retries on an error, before giving up
         """
         super().__init__()
-        self.total_images = 0
         self.request_timeout = request_timeout
         self.error_timeout = error_timeout
         self.request_retries = request_retries
@@ -117,8 +43,6 @@ class HashTagSearch(metaclass=ABCMeta):
         last_cursor = None
         while len(nodes) != 0 and cursor != last_cursor:
             instagram_posts = self.extract_instagram_posts(nodes)
-            self.total_images += len(instagram_posts)
-            log.info("Images crawled: {}".format(self.total_images))
             self.save_results(instagram_posts)
             last_cursor = cursor
             nodes, cursor = self.get_next_results(tag, cursor)
@@ -154,8 +78,8 @@ class HashTagSearch(metaclass=ABCMeta):
                 nodes = response["media"]["nodes"]
                 if "page_info" in response["media"]:
                     next_cursor = response["media"]["page_info"]["end_cursor"]
-        except Exception as e:
-            log.error(e)
+        except Exception as ex:
+            log.error(ex)
 
         return nodes, next_cursor
 
@@ -167,38 +91,26 @@ class HashTagSearch(metaclass=ABCMeta):
         """
         posts = []
         for node in nodes:
-            user = self.extract_owner_details(node["owner"])
-
-            # Extract post details
-            text = None
-            if "caption" in node:
-                text = node["caption"]
-            post = InstagramPost(node['id'], node['code'],
-                                 user=user,
-                                 caption=text,
-                                 comments=node['comments']['count'],
-                                 likes=node['likes']['count'],
-                                 img_small=node["thumbnail_src"],
-                                 img_large=node["display_src"],
-                                 created_at=node["date"],
-                                 is_video=node["is_video"])
+            post = dict()
+            post['user'] = self.extract_owner_details(node["owner"])
+            post['postId'] = node['id']
+            post['code'] = node['code']
+            post['caption'] = node['caption'] if 'caption' in node else None
+            post['comments'] = node['comments']['count']
+            post['likes'] = node['likes']['count']
+            post['imgSmall'] = node["thumbnail_src"]
+            post['imgLarge'] = node["display_src"]
+            post['postedAt'] = node["date"]
+            post['isVideo'] = node["is_video"]
             posts.append(post)
         return posts
 
     @staticmethod
     def extract_owner_details(owner):
-        """
-        Extracts the details of a user object.
-        :param owner: Instagrams JSON user object
-        :return: An Instagram User object
-        """
-        username = None
-        if "username" in owner:
-            username = owner["username"]
-        is_private = False
-        if "is_private" in owner:
-            is_private = is_private
-        user = InstagramUser(owner['id'], username=username, is_private=is_private)
+        user = dict()
+        user['userId'] = owner['id']
+        user['username'] = owner["username"] if 'username'in owner else None
+        user['isPrivate'] = True if 'is_private' in owner else False
         return user
 
     def get_headers(self, referrer):
@@ -283,11 +195,16 @@ class HashTagSearchExample(HashTagSearch):
     def __init__(self):
         super().__init__()
         self.total_posts = 0
+        self.client = MongoClient('mongodb://localhost:27017/')
+        self.db = self.client['instagram']
+        self.posts = self.db['posts']
 
     def save_results(self, instagram_results):
         super().save_results(instagram_results)
+        log.info("Posts scraped: {}".format(len(instagram_results)))
         for i, post in enumerate(instagram_results):
             self.total_posts += 1
+            self.posts.insert_one(post)
             # print("%i - %s" % (self.total_posts, post.processed_text()))
 
 
@@ -295,9 +212,10 @@ if __name__ == '__main__':
     start_time = time.time()
     log.basicConfig(level=log.INFO)
     crawler = HashTagSearchExample()
+
     try:
         crawler.extract_recent_tag("food")
     except Exception as e:
-        log.info("Posts: {}".format(crawler.total_images))
-        log.info("Elapsed time: {}".format(time.time() - start_time))
         log.info(str(e))
+    log.info("Posts: {}".format(crawler.total_posts))
+    log.info("Elapsed time: {}".format(time.time() - start_time))
