@@ -96,6 +96,10 @@ class HashTagSearch(metaclass=ABCMeta):
             post['postId'] = node['id']
             post['code'] = node['code']
             post['caption'] = node['caption'] if 'caption' in node else None
+            if post['caption'] is not None:
+                post['hashTags'] = [re.sub(r'\W+', '', word) for word in post['caption'].split() if word.startswith("#")]
+            else:
+                post['hashTags'] = []
             post['comments'] = node['comments']['count']
             post['likes'] = node['likes']['count']
             post['imgSmall'] = node["thumbnail_src"]
