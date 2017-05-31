@@ -214,8 +214,8 @@ class HashTagSearchExample(HashTagSearch):
                 new_posts += 1
             except pymongo.errors.DuplicateKeyError as ex:
                 duplicate_posts += 1
-            self.new_posts += new_posts
-            self.duplicate_posts += duplicate_posts
+        self.new_posts += new_posts
+        self.duplicate_posts += duplicate_posts
         log.info("New posts: {}".format(new_posts))
         log.info("Duplicate posts: {}".format(duplicate_posts))
 
