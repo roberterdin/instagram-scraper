@@ -1,4 +1,5 @@
 import json
+import random
 from json import JSONDecodeError
 import bs4
 import requests
@@ -142,6 +143,11 @@ class HashTagSearch(metaclass=ABCMeta):
                 post['imgLarge'] = node['node']["display_url"]
                 post['postedAt'] = node['node']["taken_at_timestamp"]
                 post['isVideo'] = node['node']["is_video"]
+
+                if not set(post['hashTags']).isdisjoint(set(_config['instagram']['excluded'])):
+                    # contains blocked hashtag, skip
+                    continue
+
                 posts.append(post)
             except KeyError as e:
                 log.error("Problems parsing post {}".format(str(e)))
@@ -200,7 +206,7 @@ if __name__ == '__main__':
     crawler = HashTagSearchExample()
 
     try:
-        crawler.extract_recent_tag(_config['instagram']['tag'])
+        crawler.extract_recent_tag(random.choice(_config['instagram']['tags']))
     except Exception as e:
         log.info(str(e))
     log.info("------------------------------")
