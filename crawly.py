@@ -1,35 +1,31 @@
+import json
+from json import JSONDecodeError
+import bs4
 import requests
 import re
 import logging as log
 from abc import ABCMeta, abstractmethod
-import time
 import pymongo
 from pymongo import MongoClient
+import sys
+import time
+import yaml
 
 
 class HashTagSearch(metaclass=ABCMeta):
-    def __init__(self, request_timeout=10, error_timeout=10, request_retries=3):
+    instagram_root = "https://www.instagram.com"
+
+    def __init__(self, ):
         """
-        This class performs a search on Instagrams hashtag search, and extracts posts for that given hashtag.
-
-        There are some limitations, as this does not extract all occurrences of the hash tag.
-
-        Instead, it extracts the most recent uses of the tag.
-
-        :param request_timeout: A timeout request
-        :param error_timeout: A timeout we sleep for it we experience an error before our next retry
-        :param request_retries: Number of retries on an error, before giving up
+        This class performs a search on Instagrams hashtag search engine, and extracts posts for that given hashtag.
         """
         super().__init__()
-        self.request_timeout = request_timeout
-        self.error_timeout = error_timeout
-        self.request_retries = request_retries
-        self.instagram_root = "https://www.instagram.com"
-
-        # We need a CSRF token, so we query Instagram first
-        self.csrf_token, self.cookie_string = self.get_csrf_and_cookie_string()
-        log.info("CSRF Token set to %s", self.csrf_token)
-        log.info("Cookie String set to %s" % self.cookie_string)
+        self.duplicate_posts = 0
+        self.new_posts = 0
+        self.client = MongoClient('mongodb://{}:{}/'.format(_config['db']['hostname'], _config['db']['port']))
+        self.db = self.client[_config['db']['database']]
+        self.posts = self.db[_config['db']['collection']]
+        self.posts.ensure_index("postId", unique=True)
 
     def extract_recent_tag(self, tag):
         """
@@ -37,51 +33,85 @@ class HashTagSearch(metaclass=ABCMeta):
         :param tag: Hashtag to extract
         """
 
-        result = requests.get("https://www.instagram.com/explore/tags/%s/?__a=1" % tag).json()
-        nodes = result["tag"]["media"]["nodes"]
-        cursor = result['tag']['media']['page_info']['end_cursor']
-        last_cursor = None
-        while len(nodes) != 0 and cursor != last_cursor:
-            instagram_posts = self.extract_instagram_posts(nodes)
-            self.save_results(instagram_posts)
-            last_cursor = cursor
-            nodes, cursor = self.get_next_results(tag, cursor)
+        url_string = "https://www.instagram.com/explore/tags/%s/" % tag
+        response = bs4.BeautifulSoup(requests.get(url_string).text, "html.parser")
+        potential_query_ids = self.get_query_id(response)
+        shared_data = self.extract_shared_data(response)
 
-    def get_csrf_and_cookie_string(self):
-        """
-        This method connects to Instagram, and returns a list of headers we need in order to process further
-        requests, including a CSRF Token
-        :return: A header parameter list
-        """
-        resp = requests.head(self.instagram_root)
+        media = shared_data['entry_data']['TagPage'][0]['tag']['media']
+        posts = []
+        for node in media['nodes']:
+            post = self.extract_recent_instagram_post(node)
+            posts.append(post)
+        self.save_results(posts)
 
-        cookie_string = "mid=%s; csrftoken=%s;" % (resp.cookies["mid"], resp.cookies['csrftoken'])
-        return resp.cookies['csrftoken'], cookie_string
+        end_cursor = media['page_info']['end_cursor']
 
-        # return resp.cookies['csrftoken'], resp.headers['set-cookie']
+        # figure out valid queryId
+        for potential_id in potential_query_ids:
+            url = "https://www.instagram.com/graphql/query/?query_id=%s&tag_name=%s&first=12&after=%s" % (
+                potential_id, tag, end_cursor)
+            try:
+                data = requests.get(url).json()
+                if 'hashtag' not in data['data']:
+                    # empty response, skip
+                    continue
+                query_id = potential_id
+                success = True
+                break
+            except JSONDecodeError as de:
+                # no valid JSON retured, most likely wrong query_id resulting in 'Oops, an error occurred.'
+                pass
+        if not success:
+            log.error("Error extracting Query Id, exiting")
+            sys.exit(1)
 
-    def get_next_results(self, tag, cursor):
-        """
-        Gets the next batch of results in the cursor.
-        :param tag: Hashtag to search
-        :param cursor: Cursor pagination object
-        :return: The next set of nodes and cursor
-        """
-        log.info("Getting %s with cursor %s" % (tag, cursor))
-        nodes = []
-        next_cursor = cursor
-        post_data = self.get_query_param(tag, cursor)
-        headers = self.get_headers("https://www.instagram.com/explore/tags/%s/" % tag)
-        try:
-            response = requests.post("https://www.instagram.com/query/", data=post_data, headers=headers).json()
-            if "media" in response and "nodes" in response["media"]:
-                nodes = response["media"]["nodes"]
-                if "page_info" in response["media"]:
-                    next_cursor = response["media"]["page_info"]["end_cursor"]
-        except Exception as ex:
-            log.error(ex)
+        while end_cursor is not None:
+            url = "https://www.instagram.com/graphql/query/?query_id=%s&tag_name=%s&first=12&after=%s" % (
+                query_id, tag, end_cursor)
+            data = requests.get(url).json()
+            if 'hashtag' not in data['data']:
+                # empty response, skip
+                continue
+            end_cursor = data['data']['hashtag']['edge_hashtag_to_media']['page_info']['end_cursor']
+            posts = self.extract_instagram_posts(data['data']['hashtag']['edge_hashtag_to_media']['edges'])
+            self.save_results(posts)
 
-        return nodes, next_cursor
+    @staticmethod
+    def extract_shared_data(doc):
+        for script_tag in doc.find_all("script"):
+            if script_tag.text.startswith("window._sharedData ="):
+                shared_data = re.sub("^window\._sharedData = ", "", script_tag.text)
+                shared_data = re.sub(";$", "", shared_data)
+                shared_data = json.loads(shared_data)
+                return shared_data
+
+    def extract_owner_details(self, owner):
+        user = dict()
+        user['userId'] = owner['id']
+        user['username'] = owner["username"] if 'username' in owner else None
+        user['isPrivate'] = True if 'is_private' in owner else False
+        return user
+
+    def extract_recent_instagram_post(self, node):
+        post = dict()
+        post['user'] = self.extract_owner_details(node["owner"])
+        post['postId'] = node['id']
+        post['code'] = node['code']
+        post['caption'] = node['caption'] if 'caption' in node else None
+        if post['caption'] is not None:
+            post['hashTags'] = [re.sub(r'\W+', '', word) for word in post['caption'].split() if
+                                word.startswith("#")]
+        else:
+            post['hashTags'] = []
+        post['comments'] = node['comments']['count']
+        post['likes'] = node['likes']['count']
+        post['imgSmall'] = node["thumbnail_src"]
+        post['imgLarge'] = node["display_src"]
+        post['postedAt'] = node["date"]
+        post['isVideo'] = node["is_video"]
+
+        return post
 
     def extract_instagram_posts(self, nodes):
         """
@@ -91,100 +121,40 @@ class HashTagSearch(metaclass=ABCMeta):
         """
         posts = []
         for node in nodes:
-            post = dict()
-            post['user'] = self.extract_owner_details(node["owner"])
-            post['postId'] = node['id']
-            post['code'] = node['code']
-            post['caption'] = node['caption'] if 'caption' in node else None
-            if post['caption'] is not None:
-                post['hashTags'] = [re.sub(r'\W+', '', word) for word in post['caption'].split() if word.startswith("#")]
-            else:
-                post['hashTags'] = []
-            post['comments'] = node['comments']['count']
-            post['likes'] = node['likes']['count']
-            post['imgSmall'] = node["thumbnail_src"]
-            post['imgLarge'] = node["display_src"]
-            post['postedAt'] = node["date"]
-            post['isVideo'] = node["is_video"]
-            posts.append(post)
+            try:
+                post = dict()
+                post['dimensions'] = dict()
+                post['dimensions']['width'] = node['node']['dimensions']['width']
+                post['dimensions']['height'] = node['node']['dimensions']['height']
+                post['user'] = self.extract_owner_details(node['node']["owner"])
+                post['postId'] = node['node']['id']
+                post['code'] = node['node']['shortcode']
+                post['caption'] = node['node']['edge_media_to_caption']['edges'][0]['node']['text'] if len(
+                    node['node']['edge_media_to_caption']['edges']) > 0 else None
+                if post['caption'] is not None:
+                    post['hashTags'] = [re.sub(r'\W+', '', word) for word in post['caption'].split() if
+                                        word.startswith("#")]
+                else:
+                    post['hashTags'] = []
+                post['comments'] = node['node']['edge_media_to_comment']
+                post['likes'] = node['node']['edge_liked_by']
+                post['imgSmall'] = node['node']["thumbnail_src"]
+                post['imgLarge'] = node['node']["display_url"]
+                post['postedAt'] = node['node']["taken_at_timestamp"]
+                post['isVideo'] = node['node']["is_video"]
+                posts.append(post)
+            except KeyError as e:
+                log.error("Problems parsing post {}".format(str(e)))
         return posts
 
-    @staticmethod
-    def extract_owner_details(owner):
-        user = dict()
-        user['userId'] = owner['id']
-        user['username'] = owner["username"] if 'username' in owner else None
-        user['isPrivate'] = True if 'is_private' in owner else False
-        return user
-
-    def get_headers(self, referrer):
-        """
-        Returns a bunch of headers we need to use when querying Instagram
-        :param referrer: The page referrer URL
-        :return: A dict of headers
-        """
-        return {
-            "referer": referrer,
-            "accept": "application/json, text/javascript, */*; q=0.01",
-            "Accept-Language": "en-GB,en;q=0.8,en-US;q=0.6",
-            "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
-            "cookie": self.cookie_string,
-            "origin": "https://www.instagram.com",
-            "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) "
-                          "Chrome/49.0.2623.87 Safari/537.36",
-            "x-csrftoken": self.csrf_token,
-            "x-instagram-ajax": "1",
-            "X-Requested-With": "XMLHttpRequest"
-        }
-
-    @staticmethod
-    def get_query_param(tag, end_cursor):
-        """
-        Returns the query params required to load next page on Instagram.
-        This can be modified to return less information.
-        :param tag: Tag we're querying
-        :param end_cursor: The end cursor Instagram specifies
-        :return: A dict of request parameters
-        """
-        return {
-            'q':
-                "ig_hashtag(%s) { media.after(%s, 100) {" % (tag, end_cursor) +
-                "  count," +
-                "  nodes {" +
-                "    caption," +
-                "    code," +
-                "    date," +
-                "    dimensions {" +
-                "      height," +
-                "      width" +
-                "    }," +
-                "    display_src," +
-                "    id," +
-                "    is_video," +
-                "    likes {" +
-                "      count," +
-                "      nodes {" +
-                "        user {" +
-                "          id," +
-                "          username," +
-                "          is_private" +
-                "        }" +
-                "      }" +
-                "    }," +
-                "    comments {" +
-                "      count" +
-                "    }," +
-                "    owner {" +
-                "      id," +
-                "      username," +
-                "      is_private" +
-                "    }," +
-                "    thumbnail_src" +
-                "  }," +
-                "  page_info" +
-                "}" +
-                " }",
-            "ref": "tags::show"}
+    def get_query_id(self, doc):
+        query_ids = []
+        for script in doc.find_all("script"):
+            if script.has_attr("src") and "en_US_Commons" in script['src']:
+                text = requests.get("%s%s" % (self.instagram_root, script['src'])).text
+                for query_id in re.findall("(?<=queryId:\")[0-9]{17,17}", text):
+                    query_ids.append(query_id)
+        return query_ids
 
     @abstractmethod
     def save_results(self, instagram_results):
@@ -197,12 +167,7 @@ class HashTagSearch(metaclass=ABCMeta):
 class HashTagSearchExample(HashTagSearch):
     def __init__(self):
         super().__init__()
-        self.duplicate_posts = 0
-        self.new_posts = 0
-        self.client = MongoClient('mongodb://localhost:27017/')
-        self.db = self.client['instagram']
-        self.posts = self.db['posts']
-        self.posts.ensure_index("postId", unique=True)
+        self.total_posts = 0
 
     def save_results(self, instagram_results):
         super().save_results(instagram_results)
@@ -221,12 +186,21 @@ class HashTagSearchExample(HashTagSearch):
 
 
 if __name__ == '__main__':
+    # import configuration
+    with open("config.yaml", 'r') as stream:
+        try:
+            global _config
+            _config = yaml.load(stream)
+        except yaml.YAMLError as exc:
+            print(exc)
+
+
     start_time = time.time()
     log.basicConfig(level=log.INFO)
     crawler = HashTagSearchExample()
 
     try:
-        crawler.extract_recent_tag("food")
+        crawler.extract_recent_tag(_config['instagram']['tag'])
     except Exception as e:
         log.info(str(e))
     log.info("------------------------------")

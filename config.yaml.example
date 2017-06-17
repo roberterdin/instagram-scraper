@@ -1,0 +1,7 @@
+db:
+  hostname: localhost
+  port: 27017
+  database: instagram
+  collection: nonfood
+instagram:
+  tag: london
