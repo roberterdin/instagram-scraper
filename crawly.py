@@ -11,6 +11,7 @@ from pymongo import MongoClient
 import sys
 import time
 import yaml
+import os
 
 
 class HashTagSearch(metaclass=ABCMeta):
@@ -193,7 +194,7 @@ class HashTagSearchExample(HashTagSearch):
 
 if __name__ == '__main__':
     # import configuration
-    with open("config.yaml", 'r') as stream:
+    with open(os.path.join(os.path.dirname(__file__), "config.yaml"), 'r') as stream:
         try:
             global _config
             _config = yaml.load(stream)
@@ -206,10 +207,13 @@ if __name__ == '__main__':
     crawler = HashTagSearchExample()
 
     try:
-        crawler.extract_recent_tag(random.choice(_config['instagram']['tags']))
+        tag = random.choice(_config['instagram']['tags'])
+        log.info("Trying to scrape: #{}".format(tag))
+        crawler.extract_recent_tag(tag)
     except Exception as e:
         log.info(str(e))
     log.info("------------------------------")
+    log.info("Scraped tag: #{}".format(tag))
     log.info("Stored posts: {}".format(crawler.new_posts))
     log.info("Duplicate posts: {}".format(crawler.duplicate_posts))
     log.info("Elapsed time: {}".format(time.time() - start_time))
